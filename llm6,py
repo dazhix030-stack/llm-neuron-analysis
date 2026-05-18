@@ -1,0 +1,258 @@
+import torch
+import re
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from collections import defaultdict
+
+# ─── 設定 ────────────────────────────────────────────────────────────────────
+MODEL_PATH = "./mistral"
+
+# ─── 分布ログ ─────────────────────────────────────────────────────────────────
+activation_log = defaultdict(list)
+
+def log_activations(model):
+    originals = {}
+    for i, layer in enumerate(model.model.layers):
+        if i not in range(0, 11):
+            continue
+        originals[i] = layer.mlp.forward
+
+        def make_patched(layer_ref, layer_idx):
+            def patched(x):
+                gate = layer_ref.mlp.act_fn(layer_ref.mlp.gate_proj(x))
+                up = layer_ref.mlp.up_proj(x)
+                intermediate = gate * up
+                for idx in [1935, 2070, 3398, 2661]:
+                    val = intermediate[:, :, idx].detach().float().mean().item()
+                    activation_log[f"L{layer_idx}_N{idx}"].append(val)
+                return layer_ref.mlp.down_proj(intermediate)
+            return patched
+
+        layer.mlp.forward = make_patched(layer, i)
+    return originals
+
+def remove_log_patches(model, originals):
+    for i, orig in originals.items():
+        model.model.layers[i].mlp.forward = orig
+
+# ─── マニピュレーター ─────────────────────────────────────────────────────────
+class LayerSpecificManipulator:
+    def __init__(self, model, config_list):
+        self.model = model
+        self.configs = config_list
+        self.originals = {}
+
+    def __enter__(self):
+        for i, layer in enumerate(self.model.model.layers):
+            layer_configs = [c for c in self.configs if i in c.get("layers", range(32))]
+            if layer_configs:
+                self.originals[i] = layer.mlp.forward
+
+                def make_patched(layer_ref, cfgs):
+                    def patched(x):
+                        gate = layer_ref.mlp.act_fn(layer_ref.mlp.gate_proj(x))
+                        up = layer_ref.mlp.up_proj(x)
+                        intermediate = gate * up
+                        for config in cfgs:
+                            idx = config["idx"]
+                            if idx < intermediate.shape[-1]:
+                                if config["mode"] == "ablate":
+                                    intermediate[:, :, idx] = 0.0
+                                elif config["mode"] == "fire":
+                                    intermediate[:, :, idx] = config.get("value", 10.0)
+                                elif config["mode"] == "additive":
+                                    intermediate[:, :, idx] += config.get("value", 0.0)
+                                elif config["mode"] == "scale":
+                                    intermediate[:, :, idx] *= config.get("value", 1.0)
+                        return layer_ref.mlp.down_proj(intermediate)
+                    return patched
+
+                layer.mlp.forward = make_patched(layer, layer_configs)
+        return self
+
+    def __exit__(self, *_):
+        for i, orig in self.originals.items():
+            self.model.model.layers[i].mlp.forward = orig
+        self.originals.clear()
+
+# ─── 実験実行 ─────────────────────────────────────────────────────────────────
+def run_experiment():
+    global activation_log
+    activation_log = defaultdict(list)
+
+    print(f"🚀 モデル読み込み中: {MODEL_PATH}")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        quantization_config=bnb_config,
+        device_map="auto"
+    )
+    model.eval()
+
+    test_prompt = """<|im_start|>system
+Solve the following math problem step by step. End your answer with #### [answer].
+<|im_end|>
+<|im_start|>user
+A water tank has two pipes. Pipe A can fill the tank in 4 hours, and Pipe B can drain the full tank in 6 hours. If both pipes are opened at the same time when the tank is empty, how many hours will it take to fill the tank to 50% capacity?
+<|im_end|>
+<|im_start|>assistant
+<think>
+"""
+
+    inputs = tokenizer(test_prompt, return_tensors="pt").to("cuda")
+    prompt_len = inputs["input_ids"].shape[1]
+    prompt_clean = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
+    prompt_raw = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=False)
+
+    def evaluate(out):
+        result_raw = tokenizer.decode(out[0], skip_special_tokens=False)
+        result_clean = tokenizer.decode(out[0], skip_special_tokens=True)
+        generated_len = out[0].shape[0] - prompt_len
+        generated_clean = result_clean[len(prompt_clean):]
+        generated_raw = result_raw[len(prompt_raw):]
+        has_leak = "<|im_start|>" in generated_raw
+        has_eos_mid = "</s>" in generated_raw
+        truncated = generated_len < 30
+        collapsed = has_leak or has_eos_mid or truncated
+        return {
+            "status": "崩壊" if collapsed else "正常",
+            "len": generated_len,
+            "text": generated_clean,
+            "leak": has_leak,
+            "eos": has_eos_mid,
+            "truncated": truncated,
+            "collapsed": collapsed,
+        }
+
+    def generate(model, inputs):
+        with torch.no_grad():
+            return model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                do_sample=False,      # 決定論的
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+    def print_result(label, data):
+        status = "🔴崩壊" if data["collapsed"] else "🟢正常"
+        flags = []
+        if data["leak"]:     flags.append("タグ漏洩")
+        if data["eos"]:      flags.append("途中EOS")
+        if data["truncated"]: flags.append("短すぎ")
+        print(f"{label} {status} tok={data['len']:3d} {' '.join(flags)}")
+        print(f"  {data['text']}")
+        print("-"*50)
+
+    # ─── STEP 1: 通常推論 + 分布ログ ─────────────────────────────────────────
+    print("\n" + "="*60)
+    print("STEP 1: 通常状態 + ニューロン分布計測")
+    print("="*60)
+
+    log_originals = log_activations(model)
+    out_normal = generate(model, inputs)
+    remove_log_patches(model, log_originals)
+
+    normal_data = evaluate(out_normal)
+    print(normal_data["text"])
+
+    print("\n── ニューロン通常時分布 ──")
+    for key, vals in sorted(activation_log.items()):
+        v = torch.tensor(vals)
+        print(f"{key}: mean={v.mean():.4f}  std={v.std():.4f}  "
+              f"min={v.min():.4f}  max={v.max():.4f}")
+
+    # ─── STEP 2: 層数スイープ ─────────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("STEP 2: 2070 層数スイープ（累積）")
+    print("="*60)
+
+    range_configs = [
+    ("Final-Fix", {"logic": [0], "process": [7,14,24,27]}),
+]
+
+    sweep_results = {}
+
+    for label, layers_dict in range_configs:
+        config = [
+            # 【性格】
+            {"idx": 2617, "mode": "fire", "value": 0.65, "layers": {0,7,15,24,30}},
+            {"idx": 2070, "mode": "fire", "value": 0.40, "layers": layers_dict["logic"]},
+            {"idx": 3291, "mode": "fire", "value": 0.35, "layers": [0, 2,7,10,24,27]},
+
+            # 【実務】
+            {"idx": 1709, "mode": "fire", "value": 0.35, "layers": [5, 7, 11,18,22,27]},
+            {"idx": 1935, "mode": "fire", "value": 0.15, "layers": ["process"]},
+            {"idx": 1936, "mode": "fire", "value": 1.0, "layers": list(range(15, 32))},
+            {"idx": 1937, "mode": "fire", "value": 1.0, "layers": list(range(20, 32))},
+            {"idx": 1938, "mode": "fire", "value": 1.0, "layers": list(range(24, 32))},
+
+            # 【包装】
+            {"idx": 3398, "mode": "fire", "value": 0.3, "layers": [7,15,25,28, 29]},
+            {"idx": 2661, "mode": "fire", "value": 0.45, "layers": [7,15,25,30, 31]}
+        ]
+
+
+        with LayerSpecificManipulator(model, config):
+            out = generate(model, inputs)
+
+        data = evaluate(out)
+        sweep_results[label] = data
+        print_result(f"{label:6s}", data)
+
+    # ─── STEP 3: 崩壊した範囲で値スイープ ────────────────────────────────────
+    # 崩壊が始まる層数を特定してから値を変えて閾値を探す
+    first_collapsed = None
+    for label, data in sweep_results.items():
+        if data["collapsed"]:
+            first_collapsed = label
+            break
+
+    if first_collapsed:
+        collapsed_layers = [2,3,4,5,6]
+        print("\n" + "="*60)
+        print(f"STEP 3: 値スイープ（崩壊開始: {first_collapsed} / layers={collapsed_layers}）")
+        print("="*60)
+
+        import numpy as np
+        for val in np.arange(0.040, 0.050, 0.001):
+            config = [{
+                "idx": 2070,
+                "mode": "fire",
+                "value": float(val),
+                "layers": collapsed_layers,
+            },
+            {
+                "idx": 1935,
+                "mode": "fire",
+                "value": float(val),
+                "layers": collapsed_layers
+            }]
+
+            with LayerSpecificManipulator(model, config):
+                out = generate(model, inputs)
+
+            data = evaluate(out)
+            status = "🔴崩壊" if data["collapsed"] else "🟢正常"
+            print(f"val={val:.2f} {status} tok={data['len']:3d} | {data['text']}")
+
+    # ─── サマリー ─────────────────────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("📊 層数スイープ サマリー")
+    print("="*60)
+    for label, data in sweep_results.items():
+        flags = []
+        if data["leak"]:      flags.append("タグ漏洩")
+        if data["eos"]:       flags.append("途中EOS")
+        if data["truncated"]: flags.append("短すぎ")
+        flag_str = " ".join(flags) if flags else "―"
+        print(f"{label:6s}: {data['status']:4s} | tok={data['len']:3d} | "
+              f"{flag_str:15s} | {data['text'][:50].strip()}")
+
+if __name__ == "__main__":
+    run_experiment()
